@@ -1,0 +1,17 @@
+[package]
+name = "a"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "1"
+rusqlite = "0.31"
+# เพิ่มสามตัวนี้ครับ
+regex = "1.10"       # สำหรับระบบรีดไขมัน (cleaner)
+walkdir = "2.5"      # สำหรับเดินสแกนไฟล์ (scanner)
+tokio = { version = "1", features = ["full"] } # สำหรับรัน Async (API)
+reqwest = { version = "0.11", features = ["json"] } # สำหรับคุยกับ AI API
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }

@@ -1,0 +1,430 @@
+--- PROJECT CONTEXT ---
+Generated: SystemTime { tv_sec: 1773133118, tv_nsec: 831447152 }
+Files included: 12
+-----------------------
+
+--- FILE: ./Cargo.toml ---
+[package]
+name = "a"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+thiserror = "1"
+rusqlite = "0.31"
+# เพิ่มสามตัวนี้ครับ
+regex = "1.10"       # สำหรับระบบรีดไขมัน (cleaner)
+walkdir = "2.5"      # สำหรับเดินสแกนไฟล์ (scanner)
+tokio = { version = "1", features = ["full"] } # สำหรับรัน Async (API)
+reqwest = { version = "0.11", features = ["json"] } # สำหรับคุยกับ AI API
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+
+
+--- FILE: ./src/brain/api.rs ---
+use crate::error::AppError;
+use serde::{Deserialize, Serialize};
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<Message>,
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct Message {
+    role: String,
+    content: String,
+}
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+#[derive(Deserialize)]
+struct Choice {
+    message: Message,
+}
+pub async fn call_ai(prompt: &str, api_key: &str) -> Result<String, AppError> {
+    let client = reqwest::Client::new();
+    let url = "https://api.groq.com/openai/v1/chat/completions";
+    let body = ChatRequest {
+        model: "llama-3.3-70b-versatile".to_string(), // ตรวจสอบชื่อรุ่นอีกที
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are a Rust expert assistant with full project context.".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: prompt.to_string(),
+            },
+        ],
+    };
+    let res = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::ApiError(format!("Request failed: {}", e)))?;
+    let status = res.status();
+    let text = res
+        .text()
+        .await
+        .map_err(|e| AppError::ApiError(e.to_string()))?;
+    if !status.is_success() {
+        return Err(AppError::ApiError(format!(
+            "Groq API Error ({}): {}",
+            status, text
+        )));
+    }
+    let response_data: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+        AppError::ApiError(format!("JSON Parse Error: {}. Response was: {}", e, text))
+    })?;
+    Ok(response_data.choices[0].message.content.clone())
+}
+pub async fn summarize_chats(history: &str, api_key: &str) -> Result<String, AppError> {
+    let prompt = format!(
+        "Summarize the following technical discussion into a concise paragraph: \n{}",
+        history
+    );
+    call_ai(&prompt, api_key).await
+}
+
+
+--- FILE: ./src/brain/memory.rs ---
+use crate::db::DbManager;
+use crate::error::AppError;
+use crate::processor::skeleton;
+pub fn prepare_context(db: &mut DbManager, window_size: usize) -> Result<String, AppError> {
+    let mut prompt = String::new();
+    let summary: String = db
+        .get_latest_summary()?
+        .unwrap_or_else(|| "No previous summary.".to_string());
+    prompt.push_str(&format!("### OVERALL PROJECT SUMMARY ###\n{}\n\n", summary));
+    prompt.push_str("### PROJECT STRUCTURE (SKELETON) ###\n");
+    let all_files = db.get_all_files()?; // เราต้องไปเพิ่มฟังก์ชันนี้ใน db.rs
+    for file in all_files {
+        let sigs = skeleton::extract_signatures(&file.content);
+        prompt.push_str(&format!("File: {}\n{}\n", file.path, sigs));
+    }
+    prompt.push_str("\n");
+    prompt.push_str("### RECENT CONVERSATION ###\n");
+    let chats = db.get_recent_chats(window_size)?;
+    for chat in chats.iter().rev() {
+        prompt.push_str(&format!("{}: {}\n", chat.role, chat.content));
+    }
+    Ok(prompt)
+}
+
+
+--- FILE: ./src/brain/mod.rs ---
+pub mod api;
+pub mod memory; // เดี๋ยวเราจะทำตัวนี้ต่อ
+
+
+--- FILE: ./src/db.rs ---
+use crate::error::AppError;
+use crate::models::{ChatMessage, FileRecord};
+use rusqlite::{Connection, Result, params};
+pub struct DbManager {
+    conn: Connection,
+}
+impl DbManager {
+    pub fn new(path: &str) -> Result<Self, AppError> {
+        let conn = Connection::open(path)?;
+        Self::init_schema(&conn)?;
+        Ok(DbManager { conn })
+    }
+    fn init_schema(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                hash TEXT NOT NULL,
+                content TEXT
+            );
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+            COMMIT;",
+        )?;
+        Ok(())
+    }
+    pub fn get_recent_chats(&self, limit: usize) -> Result<Vec<ChatMessage>, AppError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, role, content, timestamp FROM conversations ORDER BY id DESC LIMIT ?1",
+        )?;
+        let msgs = stmt
+            .query_map([limit as i64], |row| {
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    timestamp: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(msgs)
+    }
+    pub fn get_file_hash(&self, path: &str) -> Result<Option<String>, AppError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM files WHERE path = ?1")?;
+        let hash: Option<String> = stmt.query_row([path], |row| row.get(0)).ok();
+        Ok(hash)
+    }
+    pub fn upsert_files(&mut self, files: &[FileRecord]) -> Result<(), AppError> {
+        let tx = self.conn.transaction()?;
+        for file in files {
+            tx.execute(
+                "INSERT OR REPLACE INTO files (path, hash, content) VALUES (?1, ?2, ?3)",
+                params![file.path, file.hash, file.content],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn get_latest_summary(&self) -> Result<Option<String>, AppError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content FROM summaries ORDER BY id DESC LIMIT 1")?;
+        let summary: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
+        Ok(summary)
+    }
+    pub fn save_summary(&self, content: &str) -> Result<(), AppError> {
+        self.conn.execute(
+            "INSERT INTO summaries (content) VALUES (?1)",
+            params![content],
+        )?;
+        Ok(())
+    }
+    pub fn get_all_files(&self) -> Result<Vec<FileRecord>, AppError> {
+        let mut stmt = self.conn.prepare("SELECT path, hash, content FROM files")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileRecord {
+                id: None,
+                path: row.get(0)?,
+                hash: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok(files)
+    }
+    pub fn add_chat(&self, role: &str, content: &str) -> Result<(), AppError> {
+        self.conn.execute(
+            "INSERT INTO conversations (role, content) VALUES (?1, ?2)",
+            params![role, content],
+        )?;
+        Ok(())
+    }
+}
+
+
+--- FILE: ./src/error.rs ---
+use thiserror::Error;
+#[derive(Error, Debug)]
+pub enum AppError {
+    #[error("Database error: {0}")]
+    DbError(#[from] rusqlite::Error),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("AI API error: {0}")]
+    ApiError(String),
+}
+
+
+--- FILE: ./src/main.rs ---
+mod brain;
+mod db;
+mod error;
+mod models;
+mod processor;
+use clap::{Parser, Subcommand};
+use db::DbManager;
+use std::env;
+use std::io::Write;
+#[derive(Parser)]
+#[command(name = "brain")]
+#[command(about = "AI Code Assistant CLI for Rust", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+#[derive(Subcommand)]
+enum Commands {
+    Sync,
+    Ask { question: String },
+    Chat,
+    Map,
+}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let mut db = DbManager::new("brain.db")?;
+    let api_key = env::var("AI_API_KEY").unwrap_or_else(|_| "your_key_here".to_string());
+    match cli.command {
+        Commands::Sync => {
+            println!("🔍 Scanning files...");
+            let files = processor::scanner::scan_project("./src");
+            db.upsert_files(&files)?;
+            println!("✅ Updated {} files in database.", files.len());
+        }
+        Commands::Ask { question } => {
+            let files = processor::scanner::scan_project("./src");
+            db.upsert_files(&files)?;
+            db.add_chat("user", &question)?;
+            let context = brain::memory::prepare_context(&mut db, 5)?;
+            let final_prompt = format!("Context:\n{}\n\nQuestion: {}", context, question);
+            println!("🤖 Thinking...");
+            let response = brain::api::call_ai(&final_prompt, &api_key).await?;
+            println!("\nAssistant: {}", response);
+            db.add_chat("assistant", &response)?;
+        }
+        Commands::Chat => {
+            println!("💬 Entering interactive mode (type 'exit' to quit)");
+            let mut input = String::new();
+            loop {
+                print!("\nYou: ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                input.clear();
+                std::io::stdin().read_line(&mut input)?;
+                let msg = input.trim();
+                if msg == "exit" {
+                    println!("💾 Saving summary...");
+                    let history = db.get_recent_chats(20)?
+                        .iter().rev()
+                        .map(|c| format!("{}: {}", c.role, c.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !history.is_empty() {
+                        match brain::api::summarize_chats(&history, &api_key).await {
+                            Ok(summary) => { db.save_summary(&summary)?; }
+                            Err(e) => eprintln!("⚠️ Could not save summary: {}", e),
+                        }
+                    }
+                    break;
+                }
+                let files = processor::scanner::scan_project("./src");
+                db.upsert_files(&files)?;
+                db.add_chat("user", msg)?;
+                let context = brain::memory::prepare_context(&mut db, 5)?;
+                let final_prompt = format!("Context:\n{}\n\nQuestion: {}", context, msg);
+                println!("🤖 Thinking...");
+                match brain::api::call_ai(&final_prompt, &api_key).await {
+                    Ok(response) => {
+                        println!("\nAssistant: {}", response);
+                        db.add_chat("assistant", &response)?;
+                    }
+                    Err(e) => eprintln!("❌ Error: {}", e),
+                }
+            }
+        }
+        Commands::Map => {
+            let context = brain::memory::prepare_context(&mut db, 0)?;
+            println!("{}", context);
+        }
+    }
+    Ok(())
+}
+
+
+--- FILE: ./src/models.rs ---
+#[derive(Debug, Clone)]
+pub struct FileRecord {
+    pub id: Option<i64>,
+    pub path: String,
+    pub hash: String,
+    pub content: String, // โค้ดที่รีดไขมันแล้ว
+}
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub id: Option<i64>,
+    pub role: String, // "user" หรือ "assistant"
+    pub content: String,
+    pub timestamp: Option<String>,
+}
+
+
+--- FILE: ./src/processor/cleaner.rs ---
+use regex::Regex;
+pub fn trim_fat(content: &str) -> String {
+    let re_multi = Regex::new(r"(?s)/\*.*?\*/").unwrap();
+    let no_multi = re_multi.replace_all(content, "");
+    let re_single = Regex::new(r"(?m)//[!/]?.*$").unwrap();
+    let no_comments = re_single.replace_all(&no_multi, "");
+    no_comments
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+
+--- FILE: ./src/processor/mod.rs ---
+pub mod cleaner;
+pub mod scanner;
+pub mod skeleton;
+
+
+--- FILE: ./src/processor/scanner.rs ---
+use crate::models::FileRecord;
+use crate::processor::cleaner;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+use walkdir::WalkDir;
+pub fn scan_project(dir: &str) -> Vec<FileRecord> {
+    let mut results = Vec::new();
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().map_or(false, |ext| ext == "rs")
+            && !path.to_string_lossy().contains("target")
+        {
+            if let Ok(raw_content) = fs::read_to_string(path) {
+                let cleaned = cleaner::trim_fat(&raw_content);
+                let mut hasher = Sha256::new();
+                hasher.update(cleaned.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                results.push(FileRecord {
+                    id: None,
+                    path: path.to_string_lossy().into_owned(),
+                    hash,
+                    content: cleaned,
+                });
+            }
+        }
+    }
+    results
+}
+
+
+--- FILE: ./src/processor/skeleton.rs ---
+use regex::Regex;
+pub fn extract_signatures(content: &str) -> String {
+    let re = Regex::new(r"(?m)^(pub\s+)?(fn|struct|enum|trait|impl|type)\s+[\w<>, ]+").unwrap();
+    let mut skeleton = Vec::new();
+    for cap in re.captures_iter(content) {
+        let line = cap.get(0).map_or("", |m| m.as_str()).trim();
+        let clean_line = line.split('{').next().unwrap_or(line).trim();
+        if !clean_line.is_empty() {
+            skeleton.push(format!("  {}...", clean_line));
+        }
+    }
+    skeleton.join("\n")
+}
+
+
