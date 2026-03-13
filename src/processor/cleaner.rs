@@ -1,15 +1,20 @@
 use regex::Regex;
+use std::sync::OnceLock;
+
+static RE_MULTI: OnceLock<Regex> = OnceLock::new();
+static RE_SINGLE: OnceLock<Regex> = OnceLock::new();
 
 pub fn trim_fat(content: &str) -> String {
-    // 1. ลบ Multi-line comments /* ... */
-    let re_multi = Regex::new(r"(?s)/\*.*?\*/").unwrap();
-    let no_multi = re_multi.replace_all(content, "");
+    let re_multi = RE_MULTI.get_or_init(|| {
+        Regex::new(r"(?s)/\*.*?\*/").expect("Invalid multi-line comment regex")
+    });
+    let re_single = RE_SINGLE.get_or_init(|| {
+        Regex::new(r"(?m)//[!/]?.*$").expect("Invalid single-line comment regex")
+    });
 
-    // 2. ลบ Doc comments (///) และ Single-line (//)
-    let re_single = Regex::new(r"(?m)//[!/]?.*$").unwrap();
+    let no_multi = re_multi.replace_all(content, "");
     let no_comments = re_single.replace_all(&no_multi, "");
 
-    // 3. ยุบบรรทัดว่างที่ซ้อนกัน และ Trim หัวท้าย
     no_comments
         .lines()
         .map(|line| line.trim())

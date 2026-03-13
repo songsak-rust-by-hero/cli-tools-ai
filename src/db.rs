@@ -122,5 +122,4 @@ impl DbManager {
         )?;
         Ok(())
     }
-
 }

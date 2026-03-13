@@ -2,37 +2,49 @@ use crate::models::FileRecord;
 use crate::processor::cleaner;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
 use walkdir::WalkDir;
 
 pub fn scan_project(dir: &str) -> Vec<FileRecord> {
-    let mut results = Vec::new();
+    let mut results: Vec<FileRecord> = Vec::new();
 
     for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().map_or(true, |ext| ext != "rs") {
+            continue;
+        }
+        if path.to_string_lossy().contains("target") {
+            continue;
+        }
 
-        // สแกนเฉพาะไฟล์ .rs และข้ามโฟลเดอร์ target
-        if path.is_file()
-            && path.extension().map_or(false, |ext| ext == "rs")
-            && !path.to_string_lossy().contains("target")
-        {
-            if let Ok(raw_content) = fs::read_to_string(path) {
-                // 1. รีดไขมันโค้ด
-                let cleaned = cleaner::trim_fat(&raw_content);
+        if let Ok(raw_content) = fs::read_to_string(path) {
+            let cleaned = cleaner::trim_fat(&raw_content);
 
-                // 2. ทำ Hash (ใช้เนื้อหาที่คลีนแล้ว เพื่อดูความต่างของ Logic)
-                let mut hasher = Sha256::new();
-                hasher.update(cleaned.as_bytes());
-                let hash = format!("{:x}", hasher.finalize());
+            let mut hasher = Sha256::new();
+            hasher.update(cleaned.as_bytes());
+            let hash = format!("{:x}", hasher.finalize());
 
-                results.push(FileRecord {
-                    id: None,
-                    path: path.to_string_lossy().into_owned(),
-                    hash,
-                    content: cleaned,
-                });
-            }
+            results.push(FileRecord {
+                id: None,
+                path: path.to_string_lossy().into_owned(),
+                hash,
+                content: cleaned,
+            });
         }
     }
+
     results
+}
+
+// เช็ค hash ก่อน — return เฉพาะไฟล์ที่เปลี่ยนแปลง
+pub fn scan_changed<F>(dir: &str, is_changed: F) -> Vec<FileRecord>
+where
+    F: Fn(&str, &str) -> bool,
+{
+    scan_project(dir)
+        .into_iter()
+        .filter(|f| is_changed(&f.path, &f.hash))
+        .collect()
 }
